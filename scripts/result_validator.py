@@ -211,6 +211,8 @@ def execute_query(con, query_path):
     time_cost = end_time - begin_time
 
     print(f"    Query execution completed in {time_cost:.3f} seconds", flush=True)
+    # Output SQL execution time in a parseable format (for run.sh to extract)
+    print(f"SQL_EXECUTION_TIME: {time_cost:.4f}", flush=True)
     print(f"    Found {len(result)} result rows", flush=True)
 
     # Format results

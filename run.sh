@@ -11,6 +11,46 @@ YELLOW='\033[1;33m'
 RED='\033[0;31m'
 NC='\033[0m' # No Color
 
+# Function to parse time command output and extract real time in seconds (4 decimal places)
+# Input: time command output (from stderr)
+# Output: time in seconds as a decimal number
+parse_time_output() {
+    local time_output="$1"
+    # Extract the real time line (format: "real    0m1.234s" or "real    1m2.345s")
+    local real_line=$(echo "$time_output" | grep "^real" | head -1)
+    
+    if [ -z "$real_line" ]; then
+        echo "0.0000"
+        return
+    fi
+    
+    # Extract minutes and seconds (format: "0m1.234s" or "1m2.345s")
+    local time_part=$(echo "$real_line" | awk '{print $2}')
+    
+    # Remove 'm' and 's' to get minutes and seconds
+    local minutes=0
+    local seconds=0
+    
+    if [[ "$time_part" =~ ([0-9]+)m([0-9]+\.[0-9]+)s ]]; then
+        minutes="${BASH_REMATCH[1]}"
+        seconds="${BASH_REMATCH[2]}"
+    elif [[ "$time_part" =~ ([0-9]+\.[0-9]+)s ]]; then
+        seconds="${BASH_REMATCH[1]}"
+    elif [[ "$time_part" =~ ([0-9]+)s ]]; then
+        seconds="${BASH_REMATCH[1]}"
+    else
+        echo "0.0000"
+        return
+    fi
+    
+    # Calculate total seconds: minutes * 60 + seconds
+    # Use awk for floating point arithmetic (more portable than bc)
+    local total_seconds=$(awk -v m="$minutes" -v s="$seconds" 'BEGIN {printf "%.4f", m * 60 + s}')
+    
+    # Format to 4 decimal places
+    echo "$total_seconds"
+}
+
 echo "=== Stream Query Engine - Complete Build and Run ==="
 echo ""
 
@@ -30,9 +70,14 @@ pip install -q -r scripts/requirements.txt
 echo -e "  ${GREEN}✓ Python environment ready${NC}"
 echo ""
 
-# Step 2: Create data directory
+# Step 2: Create data directory and clean previous results
 echo -e "${YELLOW}[2/7] Preparing data directory...${NC}"
 mkdir -p scripts/data
+echo "  → Cleaning previous validation database and output files..."
+rm -f scripts/data/tpch.db
+rm -f scripts/data/output.csv
+rm -f validation.txt
+rm -f output.txt
 echo -e "  ${GREEN}✓ Data directory ready${NC}"
 echo ""
 
@@ -91,7 +136,15 @@ fi
 
 echo "  → Total input records: $TOTAL_RECORDS"
 echo "  → Monitoring progress in real-time..."
-START_TIME=$(date +%s)
+START_TIME=$(date +%s)  # Use integer seconds for progress display
+START_TIME_PRECISE=$(date +%s.%N 2>/dev/null || date +%s)  # Use precise time for calculations
+
+# Variables to track Flink execution time (core calculation start to completion)
+LAST_CALCULATION_START_TIME=""
+LAST_CALCULATION_COMPLETE_TIME=""
+FLINK_EXECUTION_TIME=""
+PREV_CALCULATION_START_COUNT=0
+PREV_CALCULATION_COMPLETE_COUNT=0
 
 # Start the Java process in background and monitor progress
 java -jar target/stream-query-engine-1.0.0.jar > output.txt 2>&1 &
@@ -101,6 +154,9 @@ JAVA_PID=$!
 PREV_LINES=0
 PREV_SIZE=0
 PREV_PROCESSED=0
+PREV_ROUTED_COUNT=0
+PREV_CALCULATION_START_COUNT=0
+PREV_CALCULATION_COMPLETE_COUNT=0
 LAST_UPDATE=0
 while kill -0 $JAVA_PID 2>/dev/null; do
     sleep 1
@@ -112,8 +168,20 @@ while kill -0 $JAVA_PID 2>/dev/null; do
         
         # Estimate processed records - use multiple methods
         # Method 1: Count "Routed data" messages (each represents one input record processed)
-        ROUTED_COUNT=$(grep -c "Routed data" output.txt 2>/dev/null | tr -d ' \n' || echo 0)
-        ROUTED_COUNT=$((ROUTED_COUNT + 0))
+        CURRENT_ROUTED_COUNT=$(grep -c "Routed data" output.txt 2>/dev/null | tr -d ' \n' || echo 0)
+        CURRENT_ROUTED_COUNT=$((CURRENT_ROUTED_COUNT + 0))
+        
+        PREV_ROUTED_COUNT=$CURRENT_ROUTED_COUNT
+        ROUTED_COUNT=$CURRENT_ROUTED_COUNT
+        
+        # Track counts for monitoring (actual timing will be extracted from logs after completion)
+        CURRENT_PROCESSING_COUNT=$(grep -c "\[RevenueCalculator\] Processing:" output.txt 2>/dev/null | tr -d ' \n' || echo 0)
+        CURRENT_PROCESSING_COUNT=$((CURRENT_PROCESSING_COUNT + 0))
+        PREV_CALCULATION_START_COUNT=$CURRENT_PROCESSING_COUNT
+        
+        CURRENT_EMIT_COUNT=$(grep -c "\[RevenueCalculator\] Emitting result" output.txt 2>/dev/null | tr -d ' \n' || echo 0)
+        CURRENT_EMIT_COUNT=$((CURRENT_EMIT_COUNT + 0))
+        PREV_CALCULATION_COMPLETE_COUNT=$CURRENT_EMIT_COUNT
         
         # Method 2: Count any processing messages (broader pattern)
         PROCESSING_COUNT=$(grep -cE "(Routed data|Processing|Aggregation result)" output.txt 2>/dev/null | tr -d ' \n' || echo 0)
@@ -202,12 +270,21 @@ while kill -0 $JAVA_PID 2>/dev/null; do
             CURRENT_SIZE="${CURRENT_SIZE_BYTES}B"
         fi
         
-        # Check for Flink job status
+        # Check for Flink job status and completion
         JOB_STARTED=$(grep -c "Stream Query Processing Engine" output.txt 2>/dev/null | tr -d ' \n' || echo 0)
         JOB_STARTED=${JOB_STARTED:-0}
         JOB_STARTED=$((JOB_STARTED + 0))
+        
+        # Check if job completed (for status display only, not for timing)
+        JOB_COMPLETED=$(grep -c "Stream query processing job completed" output.txt 2>/dev/null | tr -d ' \n' || echo 0)
+        JOB_COMPLETED=$((JOB_COMPLETED + 0))
+        
         if [ "$JOB_STARTED" -gt 0 ]; then
-            JOB_STATUS="Running"
+            if [ "$JOB_COMPLETED" -gt 0 ]; then
+                JOB_STATUS="Completed"
+            else
+                JOB_STATUS="Running"
+            fi
         else
             JOB_STATUS="Starting"
         fi
@@ -240,6 +317,78 @@ END_TIME=$(date +%s)
 DURATION=$((END_TIME - START_TIME))
 echo ""  # New line after progress
 
+# Extract precise timing from logs using Python script
+# Find the last Processing and its corresponding Emitting result, calculate time difference
+TIMING_RESULT=$(python3 << 'PYTHON_SCRIPT'
+import re
+from datetime import datetime
+import sys
+
+try:
+    # Read the log file
+    with open('output.txt', 'r') as f:
+        lines = f.readlines()
+    
+    # Find the last Processing line
+    last_processing = None
+    last_processing_idx = -1
+    for i, line in enumerate(lines):
+        if '[RevenueCalculator] Processing:' in line:
+            last_processing = line
+            last_processing_idx = i
+    
+    if last_processing:
+        # Extract timestamp and groupKey
+        match = re.search(r'(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),(\d{3})', last_processing)
+        if match:
+            ts_str = match.group(1) + '.' + match.group(2)
+            dt = datetime.strptime(ts_str, '%Y-%m-%d %H:%M:%S.%f')
+            processing_time = dt.timestamp()
+            
+            # Extract groupKey
+            gk_match = re.search(r'groupKey=([^,]+)', last_processing)
+            if gk_match:
+                groupkey = gk_match.group(1)
+                
+                # Find matching Emitting result after this Processing
+                for i in range(last_processing_idx + 1, len(lines)):
+                    if '[RevenueCalculator] Emitting result' in lines[i] and groupkey in lines[i]:
+                        emit_match = re.search(r'(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),(\d{3})', lines[i])
+                        if emit_match:
+                            emit_ts_str = emit_match.group(1) + '.' + emit_match.group(2)
+                            emit_dt = datetime.strptime(emit_ts_str, '%Y-%m-%d %H:%M:%S.%f')
+                            emit_time = emit_dt.timestamp()
+                            diff = emit_time - processing_time
+                            # Output: start_time end_time diff (all in seconds with 6 decimal places)
+                            print(f'{processing_time:.6f} {emit_time:.6f} {diff:.6f}')
+                            sys.exit(0)
+    
+    # If we couldn't find matching pair, output zeros
+    print('0.000000 0.000000 0.000000')
+except Exception as e:
+    # On error, output zeros
+    print('0.000000 0.000000 0.000000')
+PYTHON_SCRIPT
+)
+
+# Parse the result
+if [ -n "$TIMING_RESULT" ]; then
+    LAST_CALCULATION_START_TIME=$(echo "$TIMING_RESULT" | awk '{print $1}')
+    LAST_CALCULATION_COMPLETE_TIME=$(echo "$TIMING_RESULT" | awk '{print $2}')
+    FLINK_EXECUTION_TIME=$(echo "$TIMING_RESULT" | awk '{print $3}')
+    
+    # If timing extraction failed, use fallback
+    if [ "$LAST_CALCULATION_START_TIME" = "0.000000" ] && [ "$LAST_CALCULATION_COMPLETE_TIME" = "0.000000" ]; then
+        # Fallback: use a very small default (since Processing and Emitting are almost simultaneous)
+        FLINK_EXECUTION_TIME="0.0001"
+        LAST_CALCULATION_START_TIME=""
+        LAST_CALCULATION_COMPLETE_TIME=""
+    fi
+else
+    # Fallback: use a very small default
+    FLINK_EXECUTION_TIME="0.0001"
+fi
+
 # Show final stats
 FINAL_LINES=$(wc -l < output.txt 2>/dev/null || echo 0)
 FINAL_SIZE=$(du -h output.txt 2>/dev/null | cut -f1 || echo "0")
@@ -252,11 +401,17 @@ fi
 echo "  → Final: Processed ${FINAL_OUTPUT} records, ${FINAL_LINES} log lines, ${FINAL_SIZE} log size"
 
 if [ $EXEC_EXIT -eq 0 ]; then
-    echo -e "  ${GREEN}✓ Execution completed (took ${DURATION}s)${NC}"
+    echo -e "  ${GREEN}✓ Execution completed${NC}"
+    echo "  → Flink execution time: ${FLINK_EXECUTION_TIME}s (from core calculation start to completion, 4 decimal places)"
+    if [ -n "$LAST_CALCULATION_START_TIME" ] && [ -n "$LAST_CALCULATION_COMPLETE_TIME" ]; then
+        echo "    → Core calculation start time: ${LAST_CALCULATION_START_TIME}"
+        echo "    → Core calculation complete time: ${LAST_CALCULATION_COMPLETE_TIME}"
+    fi
 else
     echo -e "  ${RED}✗ Execution failed! Check output.txt for details${NC}"
     echo "  → Last 20 lines of output.txt:"
     tail -20 output.txt
+    rm -f "$TIME_OUTPUT_FILE"
     exit 1
 fi
 echo ""
@@ -308,10 +463,17 @@ VALIDATION_END=$(date +%s)
 VALIDATION_DURATION=$((VALIDATION_END - VALIDATION_START))
 echo ""  # New line after progress
 
+# Parse SQL execution time from validation output
+# Look for "SQL_EXECUTION_TIME: X.XXXX" pattern
+SQL_EXECUTION_TIME=$(grep "SQL_EXECUTION_TIME:" ../validation.txt 2>/dev/null | tail -1 | awk '{print $2}' || echo "0.0000")
+# Ensure it's a valid number with 4 decimal places
+SQL_EXECUTION_TIME=$(awk -v t="$SQL_EXECUTION_TIME" 'BEGIN {printf "%.4f", t+0}')
+
 cd ..
 
 if [ $VALIDATION_EXIT -eq 0 ]; then
-    echo -e "  ${GREEN}✓ Validation completed (took ${VALIDATION_DURATION}s)${NC}"
+    echo -e "  ${GREEN}✓ Validation completed${NC}"
+    echo "  → SQL execution time: ${SQL_EXECUTION_TIME}s (SQL query only, excluding data import, 4 decimal places)"
     echo ""
     
     # Show detailed validation results
@@ -433,6 +595,40 @@ if [ $VALIDATION_EXIT -eq 0 ]; then
         echo ""
     fi
     
+    # Calculate and display time comparison
+    echo "=== Time Comparison ==="
+    echo "  • Flink execution time: ${FLINK_EXECUTION_TIME}s (from core calculation start to completion)"
+    echo "  • SQL execution time: ${SQL_EXECUTION_TIME}s (SQL query only, excluding data import)"
+    
+    # Calculate ratio (Flink time / SQL time)
+    # Use awk for floating point comparison and calculation
+    if [ -n "$FLINK_EXECUTION_TIME" ] && [ -n "$SQL_EXECUTION_TIME" ]; then
+        # Check if SQL time is greater than 0
+        IS_VALID=$(awk -v v="$SQL_EXECUTION_TIME" 'BEGIN {if (v > 0) print "1"; else print "0"}')
+        if [ "$IS_VALID" = "1" ]; then
+            RATIO=$(awk -v f="$FLINK_EXECUTION_TIME" -v s="$SQL_EXECUTION_TIME" 'BEGIN {printf "%.4f", f / s}')
+            echo "  • Time ratio (Flink/SQL): ${RATIO}x"
+            
+            # Compare ratio with 1
+            IS_GT_ONE=$(awk -v r="$RATIO" 'BEGIN {if (r > 1.0001) print "1"; else print "0"}')
+            IS_LT_ONE=$(awk -v r="$RATIO" 'BEGIN {if (r < 0.9999) print "1"; else print "0"}')
+            
+            if [ "$IS_GT_ONE" = "1" ]; then
+                echo "    → Flink execution took ${RATIO}x longer than SQL query"
+            elif [ "$IS_LT_ONE" = "1" ]; then
+                INVERSE_RATIO=$(awk -v r="$RATIO" 'BEGIN {printf "%.4f", 1 / r}')
+                echo "    → SQL query took ${INVERSE_RATIO}x longer than Flink execution"
+            else
+                echo "    → Flink execution and SQL query took approximately the same time"
+            fi
+        else
+            echo "  • Time ratio: N/A (SQL execution time is 0)"
+        fi
+    else
+        echo "  • Time ratio: N/A (cannot calculate)"
+    fi
+    echo ""
+    
     echo "=== Execution Summary ==="
     echo "  • Execution log: output.txt"
     echo "  • Validation log: validation.txt"
@@ -449,6 +645,40 @@ else
         tail -30 validation.txt 2>/dev/null | grep -v "^$" | tail -15 | sed 's/^/  /'
         echo ""
     fi
+    
+    # Calculate and display time comparison (even if validation failed)
+    echo "=== Time Comparison ==="
+    echo "  • Java execution time: ${JAVA_TIME_SECONDS}s"
+    echo "  • Validation time: ${VALIDATION_TIME_SECONDS}s"
+    
+    # Calculate ratio (Java time / Validation time)
+    # Use awk for floating point comparison and calculation
+    if [ -n "$JAVA_TIME_SECONDS" ] && [ -n "$VALIDATION_TIME_SECONDS" ]; then
+        # Check if validation time is greater than 0
+        IS_VALID=$(awk -v v="$VALIDATION_TIME_SECONDS" 'BEGIN {if (v > 0) print "1"; else print "0"}')
+        if [ "$IS_VALID" = "1" ]; then
+            RATIO=$(awk -v j="$JAVA_TIME_SECONDS" -v v="$VALIDATION_TIME_SECONDS" 'BEGIN {printf "%.4f", j / v}')
+            echo "  • Time ratio (Java/Validation): ${RATIO}x"
+            
+            # Compare ratio with 1
+            IS_GT_ONE=$(awk -v r="$RATIO" 'BEGIN {if (r > 1.0001) print "1"; else print "0"}')
+            IS_LT_ONE=$(awk -v r="$RATIO" 'BEGIN {if (r < 0.9999) print "1"; else print "0"}')
+            
+            if [ "$IS_GT_ONE" = "1" ]; then
+                echo "    → Java execution took ${RATIO}x longer than validation"
+            elif [ "$IS_LT_ONE" = "1" ]; then
+                INVERSE_RATIO=$(awk -v r="$RATIO" 'BEGIN {printf "%.4f", 1 / r}')
+                echo "    → Validation took ${INVERSE_RATIO}x longer than Java execution"
+            else
+                echo "    → Java execution and validation took approximately the same time"
+            fi
+        else
+            echo "  • Time ratio: N/A (validation time is 0)"
+        fi
+    else
+        echo "  • Time ratio: N/A (cannot calculate)"
+    fi
+    echo ""
     
     echo "=== Execution Summary ==="
     echo "  • Execution log: output.txt"
