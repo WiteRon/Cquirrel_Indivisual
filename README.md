@@ -16,46 +16,21 @@ This project implements a streaming version of TPC-H Query 3 using Apache Flink.
 ## Project Structure
 
 ```mermaid
-graph TD
-    A[Project Root] --> B[src/main/java]
-    A --> C[scripts]
-    A --> D[pom.xml]
-    A --> E[run.sh]
-    A --> F[.env]
+graph TB
+    subgraph "Java Source"
+        A[config] --> A1[QueryConfig<br/>DataPathConfig<br/>OperationEnum]
+        B[domain] --> B1[DataRecord<br/>ClientRecord<br/>OrderRecord<br/>ItemRecord]
+        C[engine] --> C1[QueryEngine<br/>StreamRouter<br/>RevenueCalculator]
+        D[processor] --> D1[ClientFilter<br/>OrderJoiner<br/>ItemJoiner]
+        E[sink] --> E1[ResultWriter<br/>AsyncWriter]
+    end
     
-    B --> B1[com.streamengine.query]
-    B1 --> B2[config/]
-    B1 --> B3[domain/]
-    B1 --> B4[engine/]
-    B1 --> B5[processor/]
-    B1 --> B6[sink/]
-    B1 --> B7[util/]
-    
-    C --> C1[data/]
-    C --> C2[data_generator.py]
-    C --> C3[data_merger.py]
-    C --> C4[result_validator.py]
-    C --> C5[query3.sql]
-    
-    B2 --> B2a[QueryConfig]
-    B2 --> B2b[DataPathConfig]
-    B2 --> B2c[OperationEnum]
-    
-    B3 --> B3a[DataRecord]
-    B3 --> B3b[ClientRecord]
-    B3 --> B3c[OrderRecord]
-    B3 --> B3d[ItemRecord]
-    
-    B4 --> B4a[QueryEngine]
-    B4 --> B4b[StreamRouter]
-    B4 --> B4c[RevenueCalculator]
-    
-    B5 --> B5a[ClientFilter]
-    B5 --> B5b[OrderJoiner]
-    B5 --> B5c[ItemJoiner]
-    
-    B6 --> B6a[ResultWriter]
-    B6 --> B6b[AsyncWriter]
+    subgraph "Scripts"
+        F[data_generator.py]
+        G[data_merger.py]
+        H[result_validator.py]
+        I[query3.sql]
+    end
 ```
 
 ## Core Algorithm Flow
@@ -66,24 +41,13 @@ graph LR
     B --> C[ClientFilter]
     B --> D[OrderStream]
     B --> E[ItemStream]
-    
     C --> F[OrderJoiner]
     D --> F
     F --> G[ItemJoiner]
     E --> G
-    
     G --> H[RevenueCalculator]
     H --> I[ResultWriter]
     I --> J[Output CSV]
-    
-    style A fill:#e1f5ff
-    style B fill:#fff4e1
-    style C fill:#ffe1f5
-    style F fill:#e1ffe1
-    style G fill:#e1ffe1
-    style H fill:#ffe1e1
-    style I fill:#f5e1ff
-    style J fill:#e1f5ff
 ```
 
 **Processing Steps:**
